@@ -430,3 +430,164 @@ fn compute_fingerprint(blob: &[u8]) -> String {
         Err(_) => "(unknown fingerprint)".to_owned(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// SSH agent protocol – add / remove keys
+// ---------------------------------------------------------------------------
+
+const SSH_AGENTC_ADD_IDENTITY: u8 = 17;
+const SSH_AGENTC_REMOVE_IDENTITY: u8 = 18;
+const SSH_AGENT_SUCCESS: u8 = 6;
+const SSH_AGENT_FAILURE: u8 = 5;
+
+/// Minimal SSH message builder.
+struct SshBuf(Vec<u8>);
+
+impl SshBuf {
+    fn new() -> Self {
+        SshBuf(Vec::new())
+    }
+
+    fn put_u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_be_bytes());
+    }
+
+    /// Write an SSH string (uint32 length + bytes).
+    fn put_bytes(&mut self, data: &[u8]) {
+        self.put_u32(data.len() as u32);
+        self.0.extend_from_slice(data);
+    }
+
+    fn put_str(&mut self, s: &str) {
+        self.put_bytes(s.as_bytes());
+    }
+
+    /// Write a raw byte slice as an SSH mpint (adds sign byte if the high bit
+    /// is set). Used for ECDSA private scalars that are not pre-formatted.
+    fn put_mpint_raw(&mut self, bytes: &[u8]) {
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+        let bytes = &bytes[start..];
+        if bytes.is_empty() {
+            self.put_u32(0);
+            return;
+        }
+        if bytes[0] & 0x80 != 0 {
+            self.put_u32((bytes.len() + 1) as u32);
+            self.0.push(0x00);
+        } else {
+            self.put_u32(bytes.len() as u32);
+        }
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn into_packet(self, opcode: u8) -> Vec<u8> {
+        let body_len = (self.0.len() + 1) as u32;
+        let mut packet = Vec::with_capacity(4 + 1 + self.0.len());
+        packet.extend_from_slice(&body_len.to_be_bytes());
+        packet.push(opcode);
+        packet.extend_from_slice(&self.0);
+        packet
+    }
+}
+
+fn ecdsa_names(curve: sshkey::EcdsaCurve) -> (&'static str, &'static str) {
+    match curve {
+        sshkey::EcdsaCurve::NistP256 => ("ecdsa-sha2-nistp256", "nistp256"),
+        sshkey::EcdsaCurve::NistP384 => ("ecdsa-sha2-nistp384", "nistp384"),
+        sshkey::EcdsaCurve::NistP521 => ("ecdsa-sha2-nistp521", "nistp521"),
+    }
+}
+
+/// Encode a public key into the SSH wire format blob used by the agent protocol.
+fn public_key_blob(key: &sshkey::PublicKey) -> Vec<u8> {
+    use sshkey::public::KeyData;
+    let mut buf = SshBuf::new();
+    match key.key_data() {
+        KeyData::Ed25519(k) => {
+            buf.put_str("ssh-ed25519");
+            buf.put_bytes(&k.0);
+        }
+        KeyData::Ecdsa(k) => {
+            let (algo, curve_name) = ecdsa_names(k.curve());
+            buf.put_str(algo);
+            buf.put_str(curve_name);
+            buf.put_bytes(k.as_sec1_bytes());
+        }
+        KeyData::Rsa(k) => {
+            buf.put_str("ssh-rsa");
+            buf.put_bytes(k.e.as_bytes());
+            buf.put_bytes(k.n.as_bytes());
+        }
+        _ => {}
+    }
+    buf.0
+}
+
+/// Add a private key to the agent directly over the socket.
+pub fn add_key(socket_path: &str, key_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use sshkey::private::KeypairData;
+
+    let pem = fs::read_to_string(key_path)?;
+    let private_key = sshkey::PrivateKey::from_openssh(&pem)?;
+    let comment = private_key.comment().to_owned();
+
+    let mut buf = SshBuf::new();
+
+    match private_key.key_data() {
+        KeypairData::Ed25519(kp) => {
+            buf.put_str("ssh-ed25519");
+            buf.put_bytes(&kp.public.0);    // 32-byte public key
+            buf.put_bytes(&kp.to_bytes());  // 64-byte: seed || public
+        }
+        KeypairData::Ecdsa(kp) => {
+            let (algo, curve_name) = ecdsa_names(kp.curve());
+            buf.put_str(algo);
+            buf.put_str(curve_name);
+            buf.put_bytes(kp.public_key_bytes());
+            buf.put_mpint_raw(kp.private_key_bytes());
+        }
+        KeypairData::Rsa(kp) => {
+            buf.put_str("ssh-rsa");
+            buf.put_bytes(kp.public.n.as_bytes());
+            buf.put_bytes(kp.public.e.as_bytes());
+            buf.put_bytes(kp.private.d.as_bytes());
+            buf.put_bytes(kp.private.iqmp.as_bytes());
+            buf.put_bytes(kp.private.p.as_bytes());
+            buf.put_bytes(kp.private.q.as_bytes());
+        }
+        _ => return Err(format!("unsupported key type: {}", private_key.algorithm()).into()),
+    }
+
+    buf.put_str(&comment);
+
+    send_and_check(&buf.into_packet(SSH_AGENTC_ADD_IDENTITY), socket_path)
+}
+
+/// Remove a key from the agent directly over the socket.
+pub fn remove_key(socket_path: &str, key_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let pem = fs::read_to_string(key_path)?;
+    let private_key = sshkey::PrivateKey::from_openssh(&pem)?;
+    let blob = public_key_blob(private_key.public_key());
+
+    let mut buf = SshBuf::new();
+    buf.put_bytes(&blob);
+
+    send_and_check(&buf.into_packet(SSH_AGENTC_REMOVE_IDENTITY), socket_path)
+}
+
+fn send_and_check(packet: &[u8], socket_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.write_all(packet)?;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let body_len = u32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; body_len];
+    stream.read_exact(&mut body)?;
+
+    match body.first().copied() {
+        Some(SSH_AGENT_SUCCESS) => Ok(()),
+        Some(SSH_AGENT_FAILURE) => Err("agent returned failure".into()),
+        other => Err(format!("unexpected agent response opcode: {:?}", other).into()),
+    }
+}

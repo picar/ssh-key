@@ -134,32 +134,18 @@ fn cmd_agent_list(pid: Option<u32>) {
 }
 
 fn cmd_agent_key_remove(pid: Option<u32>, key: &str) {
-    use std::process::Command;
-
     let socket_path = resolve_agent_socket(pid);
-
-    match Command::new("ssh-add").arg("-d").arg(key).env("SSH_AUTH_SOCK", &socket_path).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("Failed to run ssh-add: {}", e);
-            std::process::exit(1);
-        }
+    if let Err(e) = agent::remove_key(&socket_path, key) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 }
 
 fn cmd_agent_key(pid: Option<u32>, add: &str) {
-    use std::process::Command;
-
     let socket_path = resolve_agent_socket(pid);
-
-    match Command::new("ssh-add").arg(add).env("SSH_AUTH_SOCK", &socket_path).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-        Err(e) => {
-            eprintln!("Failed to run ssh-add: {}", e);
-            std::process::exit(1);
-        }
+    if let Err(e) = agent::add_key(&socket_path, add) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
     }
 }
 
