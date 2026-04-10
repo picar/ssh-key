@@ -1,0 +1,10 @@
+[package]
+name = "ssh-key"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+rand = "0.8"
+sshkey = { package = "ssh-key", version = "0.6", features = ["std", "crypto", "ed25519", "p256", "p384", "p521", "rsa", "rand_core"] }
